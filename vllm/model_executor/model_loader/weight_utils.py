@@ -1247,6 +1247,12 @@ def safetensors_weights_iterator(
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+            try:
+                fd = os.open(st_file, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except Exception:
+                pass
 
 
 def multi_thread_safetensors_weights_iterator(

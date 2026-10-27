@@ -1161,6 +1161,32 @@ class SpeculativeConfig:
         return hf_config
 
     @staticmethod
+    def _apply_dict_hf_override(
+        dict_overrides: dict[str, Any],
+        hf_config: PreTrainedConfig,
+    ) -> PreTrainedConfig:
+        hf_config = SpeculativeConfig.hf_config_override(hf_config)
+
+        def _update_nested(target: Any, overrides: dict[str, Any]) -> None:
+            for key, value in overrides.items():
+                if isinstance(value, dict):
+                    nested = (
+                        target.get(key)
+                        if isinstance(target, dict)
+                        else getattr(target, key, None)
+                    )
+                    if nested is not None:
+                        _update_nested(nested, value)
+                        continue
+                if isinstance(target, dict):
+                    target[key] = value
+                else:
+                    setattr(target, key, value)
+
+        _update_nested(hf_config, dict_overrides)
+        return hf_config
+
+    @staticmethod
     def _apply_composed_hf_override(
         target_hf_overrides: Callable[[PreTrainedConfig], PreTrainedConfig],
         hf_config: PreTrainedConfig,
@@ -1188,6 +1214,10 @@ class SpeculativeConfig:
         method instead.
         """
         if not callable(target_hf_overrides):
+            if isinstance(target_hf_overrides, dict) and target_hf_overrides:
+                return functools.partial(
+                    SpeculativeConfig._apply_dict_hf_override, target_hf_overrides
+                )
             return SpeculativeConfig.hf_config_override
 
         return functools.partial(
