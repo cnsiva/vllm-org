@@ -202,12 +202,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return spec  # another Mamba layer cannot export: stay off, in lockstep with GDN
         from dataclasses import replace
 
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import _checkpoint_grid
+        from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_grid
 
         return replace(
             spec,
             num_prefill_checkpoint_blocks=1,
-            prefill_checkpoint_alignment=_checkpoint_grid(vllm_config.cache_config),
+            prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
