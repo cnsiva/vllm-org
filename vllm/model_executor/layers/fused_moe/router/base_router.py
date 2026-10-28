@@ -180,17 +180,19 @@ _mbx60 = {"buf": None, "n": 0}
 def _mbx60_dump():
     import json, time
     import os
-    while not os.path.exists("/cache/mbx-expert-stats.on"):   # no CUDA call while vLLM captures graphs at boot
+    _stats_dir = os.path.expanduser("~/.cache")
+    _trigger = os.path.join(_stats_dir, "mbx-expert-stats.on")
+    while not os.path.exists(_trigger):   # no CUDA call while vLLM captures graphs at boot
         time.sleep(1)
     side = torch.cuda.Stream(device=_mbx60["buf"].device)
     while True:
         time.sleep(2)
         with torch.cuda.stream(side):
             rows = _mbx60["buf"].cpu().tolist()
-        tmp = "/cache/mbx-expert-stats.json.tmp"
+        tmp = os.path.join(_stats_dir, "mbx-expert-stats.json.tmp")
         with open(tmp, "w") as f:
             json.dump({"t": time.time(), "slots": rows[: _mbx60["n"]]}, f)
-        __import__("os").replace(tmp, "/cache/mbx-expert-stats.json")
+        __import__("os").replace(tmp, os.path.join(_stats_dir, "mbx-expert-stats.json"))
 
 
 def _mbx60_record(router, topk_ids):

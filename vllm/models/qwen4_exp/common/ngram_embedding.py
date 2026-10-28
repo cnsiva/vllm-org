@@ -906,7 +906,8 @@ def _mbx_mmap_attach(layer) -> None:
     layer._mbx_tab = T
     _MBX_PLE_KEEP.append(T)
     mode = _mbx_os.environ.get("MBX_PLE_MMAP_PREWARM", "auto")
-    trigger = _mbx_os.environ.get("MBX_PLE_MMAP_TRIGGER", "/cache/mbx-ple-prewarm")
+    _default_cache = _mbx_os.path.expanduser("~/.cache")
+    trigger = _mbx_os.environ.get("MBX_PLE_MMAP_TRIGGER", f"{_default_cache}/mbx-ple-prewarm")
     if mode == "1":
         _mbx_mmap_populate(T, "at load")
     elif mode == "auto":
@@ -982,7 +983,8 @@ def _mbx_t_setup(layer) -> None:
         st = _mbx_os.stat(p)
         sig.append([_mbx_os.path.basename(p), o, r, cols, st.st_size, st.st_mtime_ns])
     tag = hashlib.sha1(json.dumps(sig).encode()).hexdigest()[:12]
-    d = _mbx_os.environ.get("MBX_PLE_NVME_DIR", "/cache/ple-nvme")
+    _default_cache = _mbx_os.path.expanduser("~/.cache")
+    d = _mbx_os.environ.get("MBX_PLE_NVME_DIR", f"{_default_cache}/ple-nvme")
     _mbx_os.makedirs(d, exist_ok=True)
     path = f"{d}/map-{tag}"
     t0 = time.time()
