@@ -784,5 +784,8 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
 
 
 # --- MBX 27: fp8 hybrid (VLLM_FP8_HYBRID=1) ---
-from vllm_fp8_hybrid import apply as _mbx_fp8_hybrid_apply
-_mbx_fp8_hybrid_apply()
+try:
+    from vllm_fp8_hybrid import apply as _mbx_fp8_hybrid_apply
+    _mbx_fp8_hybrid_apply()
+except ImportError:
+    pass
