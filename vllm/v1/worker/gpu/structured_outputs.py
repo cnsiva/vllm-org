@@ -8,8 +8,44 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
-# Overridden on CPU in vllm/v1/worker/cpu/shm.py.
-GRAMMAR_BITMASK_BLOCK_SIZE = 8192
+
+try:  # MBX depth
+    import mbx_depth as _mbx_depth
+except ImportError:
+    # Re-raise when a collective feature is explicitly opted into. A missing module must not
+    # silently remove one rank's hooks, including when HEAD's init prerequisite is misconfigured.
+    # This closes the hole where AGREE_INIT=1 but one rank's import failed, leaving that rank with no hooks at all
+    # while its peers entered the init collective.
+    if (__import__("os").environ.get("MBX_DEPTH_CHECK", "0") == "1"
+            or __import__("os").environ.get("MBX_DEPTH_AGREE_INIT", "0") == "1"
+            or __import__("os").environ.get("MBX_DEPTH_HEAD", "0") == "1"):
+        raise
+    _mbx_depth = None
+
+def _build_grammar_mapping(
+    req_ids: list[str],
+    grammar_req_ids: list[str],
+    cu_num_logits_np: np.ndarray,
+    num_draft_tokens_per_req: np.ndarray | None,
+    num_bonus_tokens: int,
+    mask_stride: int,
+) -> list[int]:
+    mapping: list[int] = []
+    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+    for grammar_req_id in grammar_req_ids:
+        req_idx = req_id_to_idx[grammar_req_id]
+        if num_draft_tokens_per_req is None:
+            num_positions = int(
+                cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
+            )
+        else:
+            # Grammar masks follow the scheduled layout even when adaptive
+            # verification compacts the actual CPU logit offsets to bonus-only.
+            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
+        mapping.extend(
+            req_idx * mask_stride + position for position in range(num_positions)
+        )
+    return mapping
 
 
 def grammar_invalid_drafts(
@@ -56,6 +92,7 @@ class StructuredOutputsWorker:
         vocab_size: int,
         device: torch.device,
         mask_stride: int,
+        num_bonus_tokens: int,
     ):
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
@@ -66,6 +103,7 @@ class StructuredOutputsWorker:
         self.device = device
         self.copy_stream = torch.cuda.Stream()
         self.mask_stride = mask_stride
+        self.num_bonus_tokens = num_bonus_tokens
 
     def apply_grammar_bitmask(
         self,
@@ -76,6 +114,8 @@ class StructuredOutputsWorker:
     ) -> None:
         if not grammar_req_ids:
             return
+        if _mbx_depth is not None:  # MBX depth: rows of the drafts the trim removed
+            grammar_bitmask = _mbx_depth.trim_bitmask(grammar_req_ids, grammar_bitmask)
 
         # Asynchronously copy the bitmask to GPU.
         with torch.cuda.stream(self.copy_stream):
@@ -83,15 +123,18 @@ class StructuredOutputsWorker:
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
 
-        # Each grammar request owns `mask_stride` bitmask rows. Key them by
-        # (request, position); the kernel skips positions beyond the device
-        # cu_num_logits, which adaptive verification may trim.
-        req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
-        mapping = [
-            req_id_to_idx[req_id] * self.mask_stride + position
-            for req_id in grammar_req_ids
-            for position in range(self.mask_stride)
-        ]
+        # Construct bitmask -> logits mapping
+        # Key by (request, position) rather than absolute logit index:
+        # adaptive verification finalizes per-request logit offsets on
+        # device, so the kernel resolves them from the GPU cu_num_logits.
+        mapping = _build_grammar_mapping(
+            input_batch.req_ids,
+            grammar_req_ids,
+            input_batch.cu_num_logits_np,
+            input_batch.num_draft_tokens_per_req,
+            self.num_bonus_tokens,
+            self.mask_stride,
+        )
 
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
@@ -109,7 +152,7 @@ class StructuredOutputsWorker:
         num_masks = bitmask.shape[0]
         assert num_masks == len(mapping)
         vocab_size = logits.shape[-1]
-        BLOCK_SIZE = GRAMMAR_BITMASK_BLOCK_SIZE
+        BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
         _apply_grammar_bitmask_kernel[grid](
             logits,

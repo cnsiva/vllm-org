@@ -18,6 +18,13 @@ class MTPSpeculator(TargetDependentARSpeculator):
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
+        import os as _os  # MBX 42: opt-in drafter FP8 projections / two-stage draft head
+        if _os.environ.get("MBX_DRAFT_FP8", "0") == "1":
+            import mbx_opt_quant as _mbx_oq
+            _mbx_oq.draft_loaded(draft_model)
+        if _os.environ.get("MBX_DRAFT_HEAD2"):
+            import mbx_draft_head2 as _mbx_dh2
+            _mbx_dh2.install(draft_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config

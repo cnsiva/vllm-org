@@ -5,9 +5,7 @@ from collections.abc import Callable
 
 import torch
 
-import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -158,17 +156,42 @@ else:
         return topk_ids
 
 
-def get_moe_padding_mask(num_tokens: int) -> torch.Tensor | None:
-    """Rows of the current batch that are CUDA graph or DP padding.
 
-    Routers set these rows' expert ids to -1 so the dispatch and experts skip
-    them; None when VLLM_MOE_SKIP_PADDING is off or the runner does not mark
-    padding.
-    """
-    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-        is_padding = get_forward_context().is_padding
-        return is_padding[:num_tokens] if is_padding is not None else None
-    return None
+_MBX60 = __import__("os").environ.get("MBX_EXPERT_STATS", "0") == "1"  # MBX 60
+_mbx60 = {"buf": None, "n": 0}
+
+
+def _mbx60_dump():
+    import json, time
+    import os
+    while not os.path.exists("/cache/mbx-expert-stats.on"):   # no CUDA call while vLLM captures graphs at boot
+        time.sleep(1)
+    side = torch.cuda.Stream(device=_mbx60["buf"].device)
+    while True:
+        time.sleep(2)
+        with torch.cuda.stream(side):
+            rows = _mbx60["buf"].cpu().tolist()
+        tmp = "/cache/mbx-expert-stats.json.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"t": time.time(), "slots": rows[: _mbx60["n"]]}, f)
+        __import__("os").replace(tmp, "/cache/mbx-expert-stats.json")
+
+
+def _mbx60_record(router, topk_ids):
+    if _mbx60["buf"] is None:
+        _mbx60["buf"] = torch.zeros(64, 3, dtype=torch.int64, device=topk_ids.device)
+        __import__("threading").Thread(target=_mbx60_dump, daemon=True, name="mbx60-dump").start()
+    slot = getattr(router, "_mbx60_slot", None)
+    if slot is None:
+        slot = router._mbx60_slot = _mbx60["n"]
+        _mbx60["n"] += 1
+        print(f"MBX 60: expert stats slot {slot} (E={router.global_num_experts}, top_k={router.top_k})", flush=True)
+    seen = torch.zeros(router.global_num_experts, dtype=torch.int64, device=topk_ids.device)
+    seen.index_fill_(0, topk_ids.reshape(-1).long(), 1)
+    buf = _mbx60["buf"][slot]
+    buf[0].add_(seen.sum())
+    buf[1].add_(1)
+    buf[2].add_(topk_ids.shape[0])
 
 
 class BaseRouter(FusedMoERouter):
@@ -306,6 +329,9 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+
+        if _MBX60:  # MBX 60
+            _mbx60_record(self, topk_ids)
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

@@ -36,12 +36,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
+    MambaStateShapes,
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
 from vllm.model_executor.models.qwen3_5 import (
@@ -60,7 +62,6 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
@@ -83,7 +84,6 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
@@ -93,6 +93,14 @@ from .qsa import Qwen4ExpQSAAttention
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
+
+
+def is_hc_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
+    """Enable GR/PLE SP explicitly or automatically with sequence-parallel MoE."""
+    parallel_config = vllm_config.parallel_config
+    return parallel_config.tensor_parallel_size > 1 and (
+        parallel_config.enable_hc_sp or parallel_config.use_sequence_parallel_moe
+    )
 
 
 def without_modelopt_fp4(
@@ -149,70 +157,7 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_v_scale",
     "_weight_scale",
     "_input_scale",
-    ".nvfp4_csf_fixed",
-    ".nvfp4_csf_exceptions",
 ]
-
-
-def decode_nvfp4_csf(
-    fixed: torch.Tensor, exceptions: torch.Tensor | None = None
-) -> torch.Tensor:
-    num_slabs, slab_bytes = fixed.shape
-    num_rows = num_slabs * 16
-    packed_cols = (slab_bytes - 16) // 16
-    num_cols = packed_cols * 2
-
-    base = fixed[:, :16].reshape(-1, 1)
-    stream = fixed[:, 16:].reshape(num_rows, packed_cols)
-
-    low_nibble = stream & 0x0F
-    high_nibble = (stream >> 4) & 0x0F
-
-    nibbles = torch.stack([low_nibble, high_nibble], dim=-1).reshape(
-        num_rows, num_cols
-    )
-    scales = base + nibbles
-
-    if exceptions is not None and exceptions.numel() > 0:
-        flat = exceptions.to(torch.int64)
-        pos = flat & 0x00FFFFFF
-        exact_bytes = ((flat >> 24) & 0xFF).to(torch.uint8)
-        scales.view(-1).scatter_(0, pos, exact_bytes)
-
-    return scales.view(torch.float8_e4m3fn)
-
-
-def maybe_decode_nvfp4_csf_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    pending_fixed: dict[str, torch.Tensor] = {}
-    pending_exc: dict[str, torch.Tensor] = {}
-
-    for name, tensor in weights:
-        if name.endswith(".weight_scale.nvfp4_csf_fixed"):
-            prefix = name[:-len(".nvfp4_csf_fixed")]
-            if prefix in pending_exc:
-                exc = pending_exc.pop(prefix)
-                decoded = decode_nvfp4_csf(tensor, exc)
-                yield prefix, decoded
-            else:
-                pending_fixed[prefix] = tensor
-        elif name.endswith(".weight_scale.nvfp4_csf_exceptions"):
-            prefix = name[:-len(".nvfp4_csf_exceptions")]
-            if prefix in pending_fixed:
-                fixed = pending_fixed.pop(prefix)
-                decoded = decode_nvfp4_csf(fixed, tensor)
-                yield prefix, decoded
-            else:
-                pending_exc[prefix] = tensor
-        else:
-            yield name, tensor
-
-    for prefix in list(pending_fixed.keys()):
-        fixed = pending_fixed.pop(prefix)
-        exc = pending_exc.pop(prefix, None)
-        decoded = decode_nvfp4_csf(fixed, exc)
-        yield prefix, decoded
 
 # The checkpoint stores these projections separately; runtime packs each group
 # into adjacent logical shards of a MergedColumnParallelLinear.
@@ -336,10 +281,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
+            quant_config=quant_config,  # MBX hc quant
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
+            quant_config=quant_config,  # MBX hc quant
         )
 
     def forward(
@@ -490,13 +437,7 @@ class Qwen4ExpModel(nn.Module):
             if layer_type in _QSA_LAYER_TYPES
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens: VocabParallelEmbedding | PPMissingLayer
-        if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size, config.hidden_size
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -533,6 +474,7 @@ class Qwen4ExpModel(nn.Module):
                 hc_config,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+                quant_config=vllm_config.quant_config,  # MBX hc quant
             )
         else:
             self.hyper_connection_mixer = None
@@ -710,7 +652,6 @@ class Qwen4ExpModel(nn.Module):
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_decode_nvfp4_csf_weights(weights)
         weights = (
             (
                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
@@ -763,12 +704,10 @@ class Qwen4ExpForCausalLM(
     SupportsPP,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
+    SupportsReplaySSM,
 ):
-    # The QSA indexer is not listed: quant configs read this mapping before the
-    # model is built, and `Qwen4ExpQSAAttention` fuses `indexer.index_qk_proj`
-    # into `qkv_proj` only when it is quantized like q/k/v.
     packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"] + ([] if (__import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes") or __import__("os").environ.get("MBX_QSA_UNFUSE_INDEXER", "0") == "1") else ["indexer.index_qk_proj"]),  # MBX 27
         "gate_up_proj": ["gate_proj", "up_proj"],
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -787,6 +726,12 @@ class Qwen4ExpForCausalLM(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        if vllm_config.lora_config is not None or (__import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes") or __import__("os").environ.get("MBX_QSA_UNFUSE_INDEXER", "0") == "1"):  # MBX 27
+            # LoRA does not support the merged QKV/indexer projection, so its
+            # packed mapping must keep the indexer separate.
+            self.packed_modules_mapping = self.packed_modules_mapping | {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            }
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config
@@ -795,15 +740,12 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head: ParallelLMHead | PPMissingLayer
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=vllm_config.quant_config,  # MBX lm_head quant
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -881,19 +823,37 @@ class Qwen4ExpForCausalLM(
         )
 
     @classmethod
+    def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
+        """One predicate for the replay record's shape AND dtype (they must
+        agree for the MambaSpec)."""
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+
+        return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
+
+    @classmethod
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+    ) -> tuple[torch.dtype, ...]:
+        dtypes: tuple[torch.dtype, ...] = (
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
         )
+        if cls._uses_gdn_recoverssm(vllm_config):  # replay record, fp32
+            dtypes = (*dtypes, torch.float32)
+        return dtypes
 
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -902,7 +862,7 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -911,18 +871,30 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
+        if cls._uses_gdn_recoverssm(
+            vllm_config
+        ):  # replay record [HV, spec_query_len, V + K + 1]
+            shapes = (
+                *shapes,
+                (
+                    hf_config.linear_num_value_heads // tp_size,
+                    num_spec + 1,
+                    hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1,
+                ),
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
@@ -986,7 +958,6 @@ class Qwen4ExpForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_decode_nvfp4_csf_weights(weights)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None}
         )
@@ -1012,6 +983,7 @@ class Qwen4ExpForConditionalGeneration(
     HasInnerState,
     SupportsHCSP,
     Qwen4ExpMixtureOfExperts,
+    SupportsReplaySSM,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
 
@@ -1036,6 +1008,12 @@ class Qwen4ExpForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
         nn.Module.__init__(self)
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
+        if vllm_config.lora_config is not None or (__import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes") or __import__("os").environ.get("MBX_QSA_UNFUSE_INDEXER", "0") == "1"):  # MBX 27
+            # LoRA does not support the merged QKV/indexer projection, so its
+            # packed mapping must keep the indexer separate.
+            self.packed_modules_mapping = self.packed_modules_mapping | {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            }
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is None:
@@ -1101,9 +1079,7 @@ class Qwen4ExpForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-        if not get_pp_group().is_first_rank and hasattr(
-            config.vision_config, "deepstack_visual_indexes"
-        ):
+        if not get_pp_group().is_first_rank and self.use_deepstack:
             assert self.language_model.model.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
             ), (
@@ -1186,7 +1162,6 @@ class Qwen4ExpForConditionalGeneration(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_decode_nvfp4_csf_weights(weights)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None},
             orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
@@ -1201,14 +1176,15 @@ class Qwen4ExpForConditionalGeneration(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
-    def get_mamba_state_shape_from_config(
+    def get_mamba_state_shape_from_config(  # type: ignore[override]
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
+        # GDN RecoverSSM adds a third state (the replay record) to Qwen3.5's two.
         return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod

@@ -35,7 +35,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.models.interfaces import SupportsHCSP, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsHCSP,
+    SupportsPP,
+    SupportsReplaySSM,
+)
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -53,7 +57,6 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.sequence import IntermediateTensors
 
-from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
@@ -62,6 +65,7 @@ from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
+    is_hc_sequence_parallel_enabled,
 )
 
 
@@ -169,6 +173,13 @@ def _make_draft_vllm_config(
     return draft_vllm_config
 
 
+import os as _mbx_os  # MBX 42
+if _mbx_os.environ.get("MBX_DRAFT_HEAD2") or _mbx_os.environ.get("MBX_DRAFT_HEAD2_DUMP"):
+    import mbx_draft_head2 as _mbx_dh2
+else:
+    _mbx_dh2 = None
+
+
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
@@ -253,6 +264,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hc_config,
             use_combine=False,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+            quant_config=draft_vllm_config.quant_config,  # MBX hc quant
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
@@ -297,9 +309,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        # Branch on the inputs, not the rank: the drafter is built entirely on
-        # the last PP stage, where `is_first_rank` is False.
-        if intermediate_tensors is None:
+        if get_pp_group().is_first_rank:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
@@ -399,7 +409,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts):
+class Qwen4ExpMTP(
+    nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts, SupportsReplaySSM
+):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -431,12 +443,18 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=vllm_config.quant_config,  # MBX lm_head quant
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        # MBX draft scale: sharpen the drafter's logits (exact — the verifier keeps the target's distribution)
+        import os as _os
+        _mbx_draft_scale = float(_os.environ.get("MBX_MTP_DRAFT_SCALE", "1.0"))
+        if _mbx_draft_scale != 1.0:
+            print(f"MBX MTP: draft logits scale = {_mbx_draft_scale} (MBX_MTP_DRAFT_SCALE)", flush=True)
+        self.logits_processor = LogitsProcessor(config.vocab_size, scale=_mbx_draft_scale)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -467,6 +485,10 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
+        if _mbx_dh2 is not None:  # MBX 42: two-stage draft head (exact: only the proposals change)
+            _mbx_out = _mbx_dh2.logits(self, hidden_states)
+            if _mbx_out is not None:
+                return _mbx_out
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

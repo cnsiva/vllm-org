@@ -76,12 +76,32 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    units = _collect_warmup_units(
-        worker.get_model(),
-        token_counts,
-        output_dtype,
-    )
-    for name, count in _compile_warmup_units(units).items():
+    # MBX 48: an MXFP8 drafter would compile its first signature inside CUDA-graph capture, where
+    # resolve_precision refuses to run (`_policy.py:90-91`). FP4-Local's MTP ships bf16 projections
+    # and NVFP4 experts (qwen-v5.3.md rows 23/24), so with the env unset — and even with it set, on
+    # this checkpoint — this walks exactly the one model it walks today. Defensive on purpose: if
+    # this build names the speculator's module differently we collect nothing and carry on rather
+    # than fail the boot over an optimisation.
+    import os
+
+    models = [worker.get_model()]
+    if os.environ.get("MBX_B12X_WARM_DRAFTER", "0") == "1":
+        for holder in (worker, getattr(worker, "model_runner", None)):
+            drafter_model = getattr(getattr(holder, "drafter", None), "model", None)
+            if drafter_model is not None and all(drafter_model is not m for m in models):
+                models.append(drafter_model)
+    warmup_units: dict = {}
+    for model in models:
+        try:
+            for unit in _collect_warmup_units(model, token_counts, output_dtype):
+                warmup_units.setdefault(unit.key, unit)
+        except Exception as exc:  # warm-up is an optimisation, never a boot failure
+            logger.info_once(
+                "b12x warm-up: skipped a model's units (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+    for name, count in _compile_warmup_units(warmup_units.values()).items():
         logger.info_once(
             "Warmed up %d b12x %s kernel signature(s).",
             count,

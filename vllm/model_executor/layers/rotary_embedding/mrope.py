@@ -348,7 +348,17 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         # the input video. We enlarge max_position_embeddings to 4 times to get
         # a larger the cos and sin cache. Models whose positions never exceed
         # the token count pass `positions_factor=1`.
-        self.cache_max_position_num = max_position_embeddings * positions_factor
+        served_window = 0  # MBX 46: vllm#62409
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+            spec = vllm_config.speculative_config
+            model_config = (spec and spec.target_model_config) or vllm_config.model_config
+            served_window = int(model_config.max_model_len or 0)
+        except Exception:
+            pass
+        self.cache_max_position_num = max(max_position_embeddings * positions_factor, served_window)
         super().__init__(
             head_size,
             rotary_dim,

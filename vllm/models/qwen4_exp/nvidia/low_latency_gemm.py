@@ -240,19 +240,11 @@ QWEN4_EXP_SM121_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] =
         8: SkinnyGemmConfig(8, 128, 1, vector_width=2, static_k=6144),
         16: SkinnyGemmConfig(16, 32, 1, static_k=6144),
     },
-    # QSA fused QKV/gate projection, TP=2 (LoRA keeps the indexer projection separate).
+    # QSA fused QKV/gate projection, TP=2.
     (6656, 2560): {
         1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
         2: SkinnyGemmConfig(2, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
         4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
-    },
-    # QSA fused QKV/gate + replicated indexer Q/K projection, TP=2.
-    (7296, 2560): {
-        1: SkinnyGemmConfig(1, 32, 1, vector_width=2, static_k=2560),
-        2: SkinnyGemmConfig(2, 32, 1, vector_width=2, static_k=2560),
-        4: SkinnyGemmConfig(4, 32, 1, vector_width=2, static_k=2560),
-        8: SkinnyGemmConfig(8, 32, 1, vector_width=2, static_k=2560),
-        16: SkinnyGemmConfig(16, 32, 4, vector_width=2, static_k=2560),
     },
     # GDN fused QKVZ projection, TP=2.
     (8192, 2560): {
@@ -312,6 +304,20 @@ QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY: dict[
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
     return tensor.dim() == 2 and tensor.stride() == (tensor.shape[1], 1)
 
+
+
+def _mbx_fill_plan_rows():  # MBX 59: exact-M lookup → give every planned shape the row counts its plan skips
+    import dataclasses as _dc
+    for _plans in QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.values():
+        for _plan in _plans.values():
+            _have = sorted(_plan)
+            for _m in range(1, _have[-1] + 1):
+                if _m not in _plan:
+                    _src = _plan[next(b for b in _have if b >= _m)]
+                    _plan[_m] = _dc.replace(_src, num_rows=_m)
+
+
+_mbx_fill_plan_rows()
 
 def _runtime_ok(
     x: torch.Tensor, weight: torch.Tensor, config: SkinnyGemmConfig
@@ -398,9 +404,9 @@ def enable_qwen4_exp_low_latency_gemm(
             isinstance(child, LinearBase)
             and type(child.quant_method) is UnquantizedLinearMethod
         )
-        is_head = (
-            isinstance(child, ParallelLMHead)
-            and type(child.quant_method) is UnquantizedEmbeddingMethod
+        is_head = isinstance(child, ParallelLMHead) and (
+            type(child.quant_method) is UnquantizedEmbeddingMethod
+            or type(child.quant_method) is UnquantizedLinearMethod  # MBX 45: ModelOpt-excluded bf16 head
         )
         if not (is_linear or is_head):
             continue

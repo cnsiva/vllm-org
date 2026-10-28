@@ -3,7 +3,7 @@
 import gc
 import itertools
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
@@ -33,7 +33,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -45,11 +44,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import (
-    InputBatch,
-    InputBuffers,
-    set_dummy_context,
-)
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
@@ -66,6 +61,11 @@ class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
 
+
+try:  # MBX 23
+    import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
 
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
@@ -179,9 +179,6 @@ class CudaGraphManager:
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
-        # The stream of the last capture; graphs replayed inside these ones (in
-        # their eager breaks) can capture on it to share the pool's free blocks.
-        self.capture_stream: torch.cuda.Stream | None = None
 
         self._graphs_captured = False
 
@@ -301,6 +298,8 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+            if _mbx_depth is not None and self.decode_query_len > 1:  # MBX 23: verify graphs at every draft depth
+                decode_query_lens = _mbx_depth.full_widths(self.decode_query_len)
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
@@ -325,6 +324,9 @@ class CudaGraphManager:
                 for decode_query_len in decode_query_lens:
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
+                    if _mbx_depth is not None and not _mbx_depth.capture_ok(  # MBX 23
+                            decode_query_len - 1, rounded_num_reqs, self.decode_query_len - 1):
+                        continue
 
                     if (
                         rounded_num_tokens > max_decode_tokens
@@ -353,7 +355,7 @@ class CudaGraphManager:
 
             # recoverSSM cannot capture a dummy query wider than its workspace.
             if mixed_mode and (
-                not self.vllm_config.cache_config.use_kda_recoverssm
+                not self.vllm_config.cache_config.use_recoverssm
                 or num_tokens <= max_decode_tokens
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -428,7 +430,6 @@ class CudaGraphManager:
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
-        stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -439,11 +440,9 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
             progress_bar_desc: Description shown on the capture progress bar.
-            stream: Capture on this stream instead of a new one.
 
         """
-        with graph_capture(self.device, stream) as context, ExitStack() as stack:
-            self.capture_stream = context.stream
+        with graph_capture(device=self.device), ExitStack() as stack:
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
                 stack.callback(self.ubatch_runner.abort_pending_run)
@@ -573,12 +572,10 @@ class CudaGraphManager:
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
 
-    def init_breakable_cg_runner(
-        self, model: nn.Module, key_fn: Callable[..., Hashable] | None = None
-    ) -> None:
+    def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableCUDAGraphWrapper(
-                model, self.vllm_config, key_fn=key_fn
+                model, self.vllm_config
             )
 
     def run_pw_graph(self, model: nn.Module, model_inputs: dict[str, Any]) -> Any:
@@ -699,8 +696,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             }
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
-                if not requires_raw_input_tokens(model):
-                    model_inputs["input_ids"] = None
+                model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
@@ -708,18 +704,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             if desc.num_ubatches > 1:
                 # Prepare and park threads before capture; finish runs inside it.
                 assert self.ubatch_runner is not None
-                input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
-                input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-                set_dcp_capture_context(
-                    input_batch,
-                    model_state,
-                    block_tables,
-                    input_block_tables,
-                    kv_cache_config,
-                )
                 ubatch_state = self.ubatch_runner.prepare(
-                    input_batch,
-                    input_block_tables,
+                    InputBatch.make_dummy(num_reqs, num_tokens, input_buffers),
+                    block_tables.get_dummy_block_tables(num_reqs),
                     block_tables.get_dummy_slot_mappings(num_tokens),
                     cg_mode=CUDAGraphMode.FULL,
                     for_capture=True,
@@ -753,9 +740,6 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
-            is_padding = input_buffers.is_padding[:num_tokens]
-            if pcp_manager is not None:
-                is_padding = pcp_manager.moe_is_padding(is_padding)
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
@@ -773,7 +757,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     num_tokens_across_dp=num_tokens_across_dp,
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
-                    is_padding=is_padding,
+                    is_padding=input_buffers.is_padding[:num_tokens],
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
@@ -809,27 +793,6 @@ class ModelCudaGraphManager(CudaGraphManager):
         return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
 
 
-def set_dcp_capture_context(
-    input_batch: InputBatch,
-    model_state: ModelState,
-    block_tables: BlockTables,
-    input_block_tables: Sequence[torch.Tensor],
-    kv_cache_config: KVCacheConfig,
-) -> None:
-    # Capture FULL graphs with KV context so a host-side skip of DCP context
-    # attention is not baked into the graph.
-    if block_tables.cp_size == 1:
-        return
-    set_dummy_context(
-        input_batch,
-        block_tables,
-        block_tables.cp_size * block_tables.cp_interleave,
-        kv_cache_config.num_blocks,
-        model_state.max_model_len,
-        input_block_tables=input_block_tables,
-    )
-
-
 def prepare_inputs_to_capture(
     num_reqs: int,
     num_tokens: int,
@@ -850,7 +813,7 @@ def prepare_inputs_to_capture(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
     if pcp_manager is not None:
-        input_batch = pcp_manager.prepare_inputs_for_capture_or_profile(input_batch)
+        input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
 
     block_table_provider = pcp_manager or block_tables
     input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)
@@ -860,14 +823,6 @@ def prepare_inputs_to_capture(
     )
 
     if block_tables.cp_size > 1:
-        if full_cudagraph:
-            set_dcp_capture_context(
-                input_batch,
-                model_state,
-                block_tables,
-                input_block_tables,
-                kv_cache_config,
-            )
         input_batch.dcp_local_seq_lens = prepare_dcp_local_seq_lens(
             input_buffers.dcp_local_seq_lens,
             input_batch.seq_lens,
@@ -941,10 +896,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     partition reclaims the storages of earlier cudagraph recordings once the
     real capture records new ones, leading to use-after-free crashes).
     """
-    if (
-        runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-        and not runner.needs_cudagraph_capture()
-    ):
+    if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0
 
     gc.collect()
@@ -979,7 +931,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         speculator = getattr(runner, "speculator", None)
         spec_manager_names: list[str] = []
         try:
-            if not runner.needs_cudagraph_capture():
+            if not manager.needs_capture():
                 return 0
             manager.pool = throwaway_pool
             if manager.use_breakable_cg:
@@ -1047,22 +999,26 @@ def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) ->
 
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     """Allocate the smallest KV cache that still lets every graph be captured."""
-    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
 
     kv_cache_spec = runner.get_kv_cache_spec()
-    builder = get_kv_cache_config_builder(runner.vllm_config)
-    kv_cache_groups = get_kv_cache_groups_from_builder(
-        builder, runner.vllm_config, kv_cache_spec
-    )
+    kv_cache_groups = get_kv_cache_groups(runner.vllm_config, kv_cache_spec)
     # At least one block per sequence is required to capture the graphs.
     min_blocks = (
         min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)
         or 1
     )
-    minimal_config = builder.get_kv_cache_config_from_groups(
-        runner.vllm_config, kv_cache_groups, num_blocks=min_blocks
-    )
+    saved_override = runner.cache_config.num_gpu_blocks_override
+    runner.cache_config.num_gpu_blocks_override = min_blocks
+    try:
+        minimal_config = get_kv_cache_config_from_groups(
+            runner.vllm_config, kv_cache_groups, available_memory=0
+        )
+    finally:
+        runner.cache_config.num_gpu_blocks_override = saved_override
 
     runner.initialize_kv_cache(minimal_config, is_profiling=True)
     runner.cache_config.num_gpu_blocks = minimal_config.num_blocks
@@ -1074,6 +1030,11 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     torch.accelerator.synchronize()
     if hasattr(runner.model_state, "_mamba_ctx"):
         runner.model_state._mamba_ctx = None
+    # A PIECEWISE profiling capture records its RecoverSSM step (only FULL
+    # captures skip it), and that step's commit contexts reference the
+    # profiling KV cache.
+    if (recoverssm := getattr(runner.model_state, "recoverssm", None)) is not None:
+        recoverssm.reset()
     # Invalidate the align-mode Mamba group metadata cached from the
     # profiling KVCacheConfig: the real (e.g. PP-projected) config may
     # place Mamba layers into a different group layout, so it must be

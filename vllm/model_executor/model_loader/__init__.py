@@ -159,3 +159,9 @@ __all__ = [
     "ShardedStateLoader",
     "TensorizerLoader",
 ]
+
+
+try:  # MBX loader hook
+    import mbx_loader as _mbx_loader  # noqa: F401
+except ImportError:
+    pass

@@ -3,7 +3,6 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 from collections.abc import Sequence
-from dataclasses import replace
 
 import torch
 from torch import nn
@@ -13,14 +12,8 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.model_executor.layers.mamba.abstract import (
-    MambaBase,
-    get_mamba_prefill_checkpoint_alignment,
-    get_mamba_prefill_checkpoint_grid,
-)
-from vllm.model_executor.layers.mamba.checkpoint import (
-    MambaPrefillCheckpointExporter,
-)
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment  # MBX 58
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -32,7 +25,6 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from ..common.ops.ple import ple_conv, ple_gate
 from .ngram_embedding import Qwen4ExpNGramEmbedding
@@ -101,10 +93,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
         self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
-        # The conv window ending at a checkpoint is a copy of its last inputs.
-        self._checkpoint_exporter = MambaPrefillCheckpointExporter(
-            state_len=self.conv_state_len
-        )
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
         self.ple_embedding = Qwen4ExpNGramEmbedding(
@@ -150,6 +138,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         nn.init.zeros_(self.conv1d.weight)
         self.conv1d.weight._no_reinit = True
         self.kv_cache = (torch.tensor([]),)
+        # MBX 58: prefill checkpoints (mbx_ple_ckpt), align mode + env only.
+        try:
+            import mbx_ple_ckpt as _mbx_ple_ckpt
+        except ImportError:
+            _mbx_ple_ckpt = None
+        self._mbx_ple_ckpt = _mbx_ple_ckpt
+        self._mbx_ckpt_on = bool(
+            _mbx_ple_ckpt is not None and _mbx_ple_ckpt.ON and cache_config.mamba_cache_mode == "align"
+        )
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -184,7 +181,34 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return True
 
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+
+        if uses_recoverssm(self.cache_config, self.num_spec_tokens):
+            from vllm.v1.attention.backends.ple_recoverssm import (
+                PleRecoverSSMAttentionBackend,
+            )
+
+            return PleRecoverSSMAttentionBackend
         return PleShortConvAttentionBackend
+
+    def get_prefill_checkpoint_alignment(self) -> int | None:  # MBX 58
+        return 1 if self._mbx_ckpt_on else None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig):  # MBX 58
+        spec = super().get_kv_cache_spec(vllm_config)
+        if not self._mbx_ckpt_on or spec is None:
+            return spec
+        if get_mamba_prefill_checkpoint_alignment(vllm_config) is None:
+            return spec  # another Mamba layer cannot export: stay off, in lockstep with GDN
+        from dataclasses import replace
+
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import _checkpoint_grid
+
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=_checkpoint_grid(vllm_config.cache_config),
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return MambaStateDtypeCalculator.short_conv_state_dtype(
@@ -197,26 +221,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             intermediate_size=self.hc_hidden_size,
             conv_kernel=self.conv_state_len + 1,
             num_spec=self.num_spec_tokens,
-        )
-
-    def get_prefill_checkpoint_alignment(self) -> int | None:
-        return 1 if self.cache_config.mamba_cache_mode == "align" else None
-
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        spec = super().get_kv_cache_spec(vllm_config)
-        # The scheduler takes internal checkpoints only when every Mamba layer
-        # can export them.
-        if (
-            self.get_prefill_checkpoint_alignment() is None
-            or get_mamba_prefill_checkpoint_alignment(vllm_config) is None
-            or not isinstance(spec, MambaSpec)
-        ):
-            return spec
-        grid = get_mamba_prefill_checkpoint_grid(vllm_config)
-        # Offsets are multiples of the grid, so the window holds only inputs.
-        assert grid >= self.conv_state_len
-        return replace(
-            spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=grid
         )
 
     def _short_conv_dilated_dispatch(
@@ -346,14 +350,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 has_initial_states=has_initial_states,
                 token_indices=token_indices_p,
             )
-            if metadata.checkpoint is not None:
-                assert metadata.non_spec_query_start_loc is not None
-                self._checkpoint_exporter.export(
-                    metadata.checkpoint,
-                    raw_qkv=inputs,
-                    conv_state=conv_state,
-                    cu_seqlens=metadata.non_spec_query_start_loc,
-                    token_indices=non_spec_token_indices,
+            # MBX 58: the window at the checkpoint position, into the checkpoint's own slot.
+            ckpt = getattr(metadata, "mbx_ple_checkpoint", None)
+            if ckpt is not None:
+                self._mbx_ple_ckpt.export(
+                    inputs_p, conv_state, token_indices_p, query_start_loc, ckpt, self.conv_state_len
                 )
         else:
             num_decode_rows = (

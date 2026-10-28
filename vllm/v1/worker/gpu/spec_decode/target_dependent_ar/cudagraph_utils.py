@@ -19,6 +19,11 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 
+try:  # MBX 23
+    import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
+
 @dataclass(frozen=True)
 class SpeculatorBatchDescriptor(BatchExecutionDescriptor):
     num_speculative_tokens: int = 0
@@ -57,7 +62,19 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
         specialize_spec_tokens: bool = False,
     ) -> None:
-        if specialize_spec_tokens:
+        _mbx_ks = (_mbx_depth.full_depths(self.vllm_config.num_speculative_tokens)  # MBX 23
+                   if _mbx_depth is not None and specialize_spec_tokens else None)
+        if _mbx_ks and len(_mbx_ks) > 1:
+            self._capture_descs = {
+                mode: [
+                    SpeculatorBatchDescriptor(**vars(desc), num_speculative_tokens=k)
+                    for desc in descs
+                    for k in sorted(set(_mbx_ks) - {0, 1}, reverse=True)
+                    if _mbx_depth.capture_ok(k, desc.num_reqs, self.vllm_config.num_speculative_tokens)
+                ]
+                for mode, descs in self._capture_descs.items()
+            }
+        elif specialize_spec_tokens:
             speculative_config = self.vllm_config.speculative_config
             assert speculative_config is not None
             dense_schedule = build_dynamic_sd_schedule_lookup(

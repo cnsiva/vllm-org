@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
@@ -16,7 +17,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp8Dynamic,
 )
-from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
@@ -80,8 +80,12 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
-        replace_parameter(layer, "weight", weight.contiguous())
-        replace_parameter(layer, "weight_scale", weight_scale_swizzled.contiguous())
+        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(
+            weight_scale_swizzled.contiguous(), requires_grad=False
+        )
+        _b = __import__("os").environ.get("MBX_MXFP8_FI_BACKEND", "cutlass")  # MBX 44
+        layer._mbx_fi_backend = "cutlass" if (_b == "b12x" and K % 128) else _b
 
     def apply_weights(
         self,
@@ -113,7 +117,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=getattr(layer, "_mbx_fi_backend", "cutlass"),  # MBX 44
         )
 
         if bias is not None:
@@ -158,8 +162,10 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
         # Store weight column-major [K, N] as mm_mxfp8 expects for operand B.
-        replace_parameter(layer, "weight", weight.contiguous().t())
-        replace_parameter(layer, "weight_scale", weight_scale_swizzled.contiguous())
+        layer.weight = Parameter(weight.contiguous().t(), requires_grad=False)
+        layer.weight_scale = Parameter(
+            weight_scale_swizzled.contiguous(), requires_grad=False
+        )
 
     def apply_weights(
         self,
@@ -245,19 +251,17 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         else:
             weight = weight.contiguous()
 
-        replace_parameter(
-            layer,
-            "weight",
+        layer.weight = Parameter(
             shuffle_matrix_a(weight, 128).reshape(padded_n, K),
+            requires_grad=False,
         )
-        replace_parameter(
-            layer,
-            "weight_scale",
+        layer.weight_scale = Parameter(
             shuffle_matrix_sf_a(
                 weight_scale,
                 128,
                 num_elts_per_sf=MXFP8_BLOCK_SIZE,
             ).reshape(-1),
+            requires_grad=False,
         )
         layer._mxfp8_trtllm_output_size = N
 
