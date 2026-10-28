@@ -163,5 +163,5 @@ __all__ = [
 
 try:  # MBX loader hook
     import mbx_loader as _mbx_loader  # noqa: F401
-except ImportError:
+except (ImportError, OSError):
     pass

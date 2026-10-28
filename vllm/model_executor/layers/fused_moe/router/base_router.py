@@ -157,6 +157,22 @@ else:
 
 
 
+import vllm.envs as envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
+
+def get_moe_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """Rows of the current batch that are CUDA graph or DP padding.
+
+    Routers set these rows' expert ids to -1 so the dispatch and experts skip
+    them; None when VLLM_MOE_SKIP_PADDING is off or the runner does not mark
+    padding.
+    """
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        is_padding = get_forward_context().is_padding
+        return is_padding[:num_tokens] if is_padding is not None else None
+    return None
+
+
 _MBX60 = __import__("os").environ.get("MBX_EXPERT_STATS", "0") == "1"  # MBX 60
 _mbx60 = {"buf": None, "n": 0}
 
