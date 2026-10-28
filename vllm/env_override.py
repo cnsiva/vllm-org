@@ -1,8 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E402
+import ctypes
 import importlib.util
 import os
+
+if not hasattr(ctypes, "_mbx_patched"):
+    _orig_cdll = ctypes.CDLL
+    class _MbxCDLL(_orig_cdll):
+        def __init__(self, name, *args, **kwargs):
+            if isinstance(name, str) and "/opt/mbx/" in name:
+                mbx_dir = os.environ.get("MBX_DIR", "/home/siva/github-sources/DGX-Spark-Recipes/vllm/lib/mbx")
+                name = name.replace("/opt/mbx", mbx_dir)
+            super().__init__(name, *args, **kwargs)
+    ctypes.CDLL = _MbxCDLL
+    ctypes._mbx_patched = True
 
 
 def _get_torch_root():
