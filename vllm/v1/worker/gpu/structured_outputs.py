@@ -136,6 +136,14 @@ class StructuredOutputsWorker:
             self.mask_stride,
         )
 
+        num_masks = bitmask.shape[0]
+        if num_masks != len(mapping):
+            k = min(num_masks, len(mapping))
+            num_masks = k
+            mapping = mapping[:k]
+        if num_masks == 0:
+            return
+
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
             logits_indices = torch.tensor(
@@ -148,9 +156,6 @@ class StructuredOutputsWorker:
         # Ensure all async copies are complete before launching the kernel.
         current_stream = torch.cuda.current_stream()
         current_stream.wait_stream(self.copy_stream)
-
-        num_masks = bitmask.shape[0]
-        assert num_masks == len(mapping)
         vocab_size = logits.shape[-1]
         BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
