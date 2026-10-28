@@ -121,17 +121,35 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                     del sh.head
                     sh.head = target_lm_head
 
-    import os as _os  # MBX 34
-    import mbx_draft_head as _dh
-    if (target_lm_head is not None and getattr(eagle_model, "lm_head", None) is target_lm_head
-            and _dh.wanted()):
-        _dhead = _dh.make(target_lm_head)
-        eagle_model.lm_head = _dhead
-        for _layer in (getattr(draft_inner, "layers", None) or {}).values() if isinstance(getattr(draft_inner, "layers", None), nn.ModuleDict) else (getattr(draft_inner, "layers", None) or []):
-            _sh = getattr(_layer, "shared_head", None)
-            if _sh is not None and getattr(_sh, "head", None) is target_lm_head:
-                del _sh.head
-                _sh.head = _dhead
+    try:
+        import ctypes as _ctypes
+        if not hasattr(_ctypes, "_mbx_patched"):
+            class _PatchedCDLL(_ctypes.CDLL):
+                def __init__(self, name, *args, **kwargs):
+                    if isinstance(name, str) and "/opt/mbx/" in name:
+                        import os
+                        _mbx = os.environ.get("MBX_DIR", "/home/siva/github-sources/DGX-Spark-Recipes/vllm/lib/mbx")
+                        name = name.replace("/opt/mbx", _mbx)
+                    super().__init__(name, *args, **kwargs)
+            _ctypes.CDLL = _PatchedCDLL
+            _ctypes._mbx_patched = True
+
+        import os as _os  # MBX 34
+        import mbx_draft_head as _dh
+        if (target_lm_head is not None and getattr(eagle_model, "lm_head", None) is target_lm_head
+                and _dh.wanted()):
+            _dhead = _dh.make(target_lm_head)
+            eagle_model.lm_head = _dhead
+            for _layer in (getattr(draft_inner, "layers", None) or {}).values() if isinstance(getattr(draft_inner, "layers", None), nn.ModuleDict) else (getattr(draft_inner, "layers", None) or []):
+                _sh = getattr(_layer, "shared_head", None)
+                if _sh is not None and getattr(_sh, "head", None) is target_lm_head:
+                    del _sh.head
+                    _sh.head = _dhead
+    except Exception as _e:
+        import logging
+        logging.getLogger("vllm.spec_decode.eagle").warning(
+            f"MBX draft head init skipped or failed: {_e}; sharing unquantized target head"
+        )
 
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that
