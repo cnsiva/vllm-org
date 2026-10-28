@@ -354,8 +354,9 @@ class CudaGraphManager:
                         descs_by_mode[decode_mode].append(ubatch_desc)
 
             # recoverSSM cannot capture a dummy query wider than its workspace.
+            _use_rec = getattr(self.vllm_config.cache_config, "use_recoverssm", getattr(self.vllm_config.cache_config, "use_kda_recoverssm", False))
             if mixed_mode and (
-                not self.vllm_config.cache_config.use_recoverssm
+                not _use_rec
                 or num_tokens <= max_decode_tokens
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
